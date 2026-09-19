@@ -3,8 +3,8 @@ name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
 tools: read, bash, write, edit
 deny-tools: claude
-model: anthropic/claude-sonnet-4-6
-thinking: minimal
+model: anthropic/claude-opus-5
+thinking: high
 spawning: false
 auto-exit: true
 system-prompt: append

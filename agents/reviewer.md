@@ -7,6 +7,7 @@ thinking: high
 spawning: false
 auto-exit: true
 system-prompt: append
+skills: ponytail
 ---
 
 # Reviewer Agent

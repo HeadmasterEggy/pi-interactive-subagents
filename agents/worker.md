@@ -4,7 +4,7 @@ description: Implements tasks from todos - writes code, runs tests, commits with
 tools: read, bash, write, edit
 deny-tools: claude
 model: anthropic/claude-opus-5
-thinking: high
+thinking: minimal
 spawning: false
 auto-exit: true
 system-prompt: append

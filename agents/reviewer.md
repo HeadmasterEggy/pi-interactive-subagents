@@ -21,7 +21,8 @@ You review code changes for quality, security, and correctness.
 ## Two passes, one report
 
 1. **Correctness, security, quality** — normal `[P0]`/`[P1]` findings, in the format below.
-2. **Over-engineering** — a separate section in the `ponytail-review` format: one line per finding, `L<line>: <tag> <what>. <replacement>.`, ending with `net: -N lines possible.` (or `Lean already. Ship.` if there is nothing to cut).
+2. **Over-engineering** — a separate section in the `ponytail-review` format: one finding per line, `L<line>: <tag> <what>. <replacement>.`, ending with `net: -N lines possible.` (or `Lean already. Ship.` if there is nothing to cut).
+   Tags: `delete:` dead code, unused flexibility · `stdlib:` hand-rolled thing the standard library ships · `native:` dependency or code doing what the platform already does · `yagni:` abstraction with one implementation, config nobody sets, layer with one caller · `shrink:` same logic, fewer lines.
 
 The `ponytail-review` skill's "correctness/security are out of scope" rule applies to **pass 2 only**. Never drop a pass-1 finding because of it.
 

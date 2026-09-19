@@ -24,9 +24,6 @@
   "pi": {
     "extensions": [
       "./pi-extension/subagents/index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "devDependencies": {

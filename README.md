@@ -68,8 +68,10 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_message`   | Message a subagent by name; steer it if running, resume it if finished                      |
 | `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| `subagent_resume`    | Resume a previous sub-agent session by file path (async)                                    |
+| `ask_question`       | *(subagent only)* Ask the parent a question and wait without exiting                        |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -197,6 +199,20 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ---
 
+## ask_question — Waiting Child-to-Parent Questions
+
+A subagent can call `ask_question({ question: "…" })` when it needs clarification. The child stays open in `waiting`; the parent receives the question and replies with:
+
+```typescript
+subagent_message({ name: "Worker", message: "Use schema v2." });
+```
+
+`subagent_message` uses the same name after completion: it steers a running child or resumes a finished child's session. Names are made unique within the parent session (`Worker`, `Worker-2`, …).
+
+Resuming replays the **sandbox snapshot** written at spawn time (`<session>.loadout.json`), so the resumed process keeps its original model, system prompt, tool allowlist, denied tools, and cwd. If no snapshot exists (a session predating this feature), resume still works but the result says so explicitly instead of silently relaunching with the default model and full toolset.
+
+`caller_ping` remains available for compatibility when the child should exit before requesting help.
+
 ## caller_ping — Child-to-Parent Help Request
 
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
@@ -276,7 +292,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
 ---
 name: my-agent
 description: Does something specific
-model: anthropic/claude-sonnet-4-6
+model: deepseek/deepseek-v4-flash
 thinking: minimal
 tools: read, bash, edit, write
 session-mode: lineage-only
@@ -294,7 +310,7 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
+| `model`       | string  | Default model (e.g. `deepseek/deepseek-v4-flash`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
@@ -385,7 +401,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`, `subagent_resume`):
 
 ```yaml
 ---
@@ -452,11 +468,11 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+Alt+O`:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
+[scout] — 12 tools · 4 denied  (Ctrl+Alt+O)              ← collapsed
+[scout] — 12 available  (Ctrl+Alt+O to collapse)          ← expanded
   read, bash, edit, write, todo, ...
   denied: subagent, subagents_list, ...
 ```

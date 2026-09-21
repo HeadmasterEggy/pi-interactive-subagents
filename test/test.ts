@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,12 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
+  readNameRegistry,
+  readSubagentLoadout,
+  registerName,
+  resolveNameInRegistry,
   seedSubagentSessionFile,
+  writeSubagentLoadout,
 } from "../pi-extension/subagents/session.ts";
 
 import {
@@ -49,12 +54,17 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  waitForAnswer,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import {
+  __pollForExitTest__,
+  pollForExit,
+  SURFACE_LOST_TOLERANCE,
+} from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
 
@@ -82,16 +92,20 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const eventHandlers: Record<string, Function[]> = {};
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    eventHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(name: string, handler: Function) {
+        (eventHandlers[name] ??= []).push(handler);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -448,6 +462,95 @@ describe("session.ts", () => {
       assert.equal(entries[1].type, "model_change");
       assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
       assert.equal(entries.some((entry) => entry.type === "message"), false);
+    });
+  });
+
+  describe("name registry", () => {
+    it("persists and resolves subagent names", () => {
+      withTempDir((dir) => {
+        registerName(dir, "scout", { sessionFile: "/tmp/scout.jsonl" });
+        assert.deepEqual(readNameRegistry(dir), {
+          scout: { sessionFile: "/tmp/scout.jsonl" },
+        });
+        assert.deepEqual(resolveNameInRegistry(dir, "scout"), {
+          sessionFile: "/tmp/scout.jsonl",
+        });
+        assert.equal(resolveNameInRegistry(dir, "missing"), null);
+      });
+    });
+  });
+
+  describe("loadout snapshot", () => {
+    const emptyLoadout = {
+      agent: null,
+      toolAllowlist: null,
+      denyTools: null,
+      model: null,
+      thinking: null,
+      systemPromptMode: null,
+      identity: null,
+      autoExit: false,
+      cwd: null,
+      agentDir: null,
+    };
+
+    it("round-trips a loadout beside the session file", () => {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "child.jsonl");
+        const loadout = {
+          ...emptyLoadout,
+          agent: "scout",
+          toolAllowlist: "read,bash",
+          denyTools: "claude",
+          model: "deepseek/deepseek-v4-flash",
+          thinking: "high",
+          systemPromptMode: "append" as const,
+          identity: "You are scout.",
+          autoExit: true,
+          cwd: "/tmp/demo",
+        };
+        writeSubagentLoadout(sessionFile, loadout);
+        assert.deepEqual(readSubagentLoadout(sessionFile), loadout);
+      });
+    });
+
+    it("returns null when no snapshot exists", () => {
+      withTempDir((dir) => {
+        assert.equal(readSubagentLoadout(join(dir, "missing.jsonl")), null);
+      });
+    });
+
+    it("replays model, identity, and tool restriction onto the command", () => {
+      withTempDir((dir) => {
+        const testApi = (subagentsModule as any).__test__;
+        const parts: string[] = ["pi"];
+        testApi.applyLoadoutToParts(
+          parts,
+          {
+            ...emptyLoadout,
+            model: "m",
+            thinking: "high",
+            systemPromptMode: "append",
+            identity: "You are scout.",
+            toolAllowlist: "read,bash",
+          },
+          { artifactDir: dir, name: "scout" },
+        );
+
+        assert.deepEqual(parts.slice(0, 3), ["pi", "--model", "'m:high'"]);
+        assert.equal(parts[3], "--append-system-prompt");
+        assert.match(parts[4], /scout-sysprompt-\d{4}-\d{2}-\d{2}T.*\.md'$/);
+        assert.deepEqual(parts.slice(5), ["--tools", "'read,bash'"]);
+      });
+    });
+
+    it("leaves an unrestricted spawn unconstrained", () => {
+      withTempDir((dir) => {
+        const testApi = (subagentsModule as any).__test__;
+        const parts: string[] = ["pi"];
+        testApi.applyLoadoutToParts(parts, emptyLoadout, { artifactDir: dir, name: "x" });
+        assert.deepEqual(parts, ["pi"]);
+      });
     });
   });
 
@@ -1082,7 +1185,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,ask_question,caller_ping,subagent_done",
     );
   });
 
@@ -1091,24 +1194,27 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
+  it("buildPiPromptArgs puts skills and the task in one message", () => {
+    // Separate arguments would become queued follow-ups delivered after the
+    // first turn, which lands the skill text on a child blocked in
+    // ask_question and too late to shape the work.
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
+      ["/skill:review /skill:lint @artifact.md"],
     );
   });
 
-  it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
+  it("buildPiPromptArgs passes only the task when there are no skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
       ["@artifact.md"],
     );
   });
 
-  it("buildPiPromptArgs omits separator for direct launches with skills", () => {
+  it("buildPiPromptArgs keeps a direct task in the same message as skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
-      ["/skill:review", "do the task"],
+      ["/skill:review do the task"],
     );
   });
 
@@ -1217,6 +1323,97 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("ask_question writes a signal and suppresses auto-exit until an answer", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    const previousSession = process.env.PI_SUBAGENT_SESSION;
+    const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    const handlers: Record<string, Function> = {};
+    const tools: any[] = [];
+    let shutdowns = 0;
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+
+    try {
+      subagentDoneExtension({
+        on(name: string, handler: Function) { handlers[name] = handler; },
+        registerTool(tool: any) { tools.push(tool); },
+        registerShortcut() {},
+        getAllTools() { return []; },
+      } as any);
+      const tool = tools.find((candidate) => candidate.name === "ask_question");
+      assert.ok(tool);
+
+      // The tool now BLOCKS until an answer sidecar appears, so it must not be
+      // awaited before the answer is written.
+      const pending = tool.execute("call-1", { question: "Which schema?" });
+      const askFile = `${sessionFile}.ask`;
+      const askDeadline = Date.now() + 2000;
+      while (!existsSync(askFile) && Date.now() < askDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(
+        JSON.parse(readFileSync(askFile, "utf8")).question,
+        "Which schema?",
+      );
+
+      // While blocked, the turn cannot end, so auto-exit must not fire.
+      const ctx = { shutdown() { shutdowns++; } };
+      const event = { messages: [{ role: "assistant", stopReason: "stop" }] };
+      handlers.agent_end(event, ctx);
+      assert.equal(shutdowns, 0);
+
+      // The answer releases the block and is returned as the tool result.
+      writeFileSync(`${sessionFile}.answer`, JSON.stringify({ text: "v2" }));
+      const result = await pending;
+      assert.equal(result.details.answered, true);
+      assert.match(result.content[0].text, /v2/);
+      assert.equal(existsSync(`${sessionFile}.answer`), false);
+
+      // With the wait over, a finished turn auto-exits again.
+      handlers.agent_end(event, ctx);
+      assert.equal(shutdowns, 1);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  describe("waitForAnswer", () => {
+    it("consumes a written answer", async () => {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "child.jsonl");
+        writeFileSync(`${sessionFile}.answer`, JSON.stringify({ text: "ALPHA" }));
+        return waitForAnswer(sessionFile, undefined, 1000).then((outcome) => {
+          assert.deepEqual(outcome, { ok: true, text: "ALPHA" });
+          // Consumed, so a later ask cannot replay a stale answer.
+          assert.equal(existsSync(`${sessionFile}.answer`), false);
+        });
+      });
+    });
+
+    it("times out instead of blocking forever", async () => {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "child.jsonl");
+        return waitForAnswer(sessionFile, undefined, 40).then((outcome) => {
+          assert.deepEqual(outcome, { ok: false, reason: "timeout" });
+        });
+      });
+    });
+
+    it("gives up when the ask is aborted", async () => {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "child.jsonl");
+        const controller = new AbortController();
+        controller.abort();
+        return waitForAnswer(sessionFile, controller.signal, 1000).then((outcome) => {
+          assert.deepEqual(outcome, { ok: false, reason: "cancelled" });
+        });
+      });
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1459,6 +1656,25 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("records ask_question as waiting", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "asking-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "asking-child",
+        activityFile,
+        now: () => 2_500,
+      });
+      recorder.sessionStart();
+      recorder.askQuestion();
+
+      const read = readSubagentActivityFile(activityFile, "asking-child");
+      assert.ok(read.ok);
+      assert.equal(read.activity.phase, "waiting");
+      assert.equal(read.activity.latestEvent, "ask_question");
+      assert.equal(read.activity.waitingSince, 2_500);
+    });
+  });
+
   it("records waiting and final done states", () => {
     withTempDir((dir) => {
       let currentNow = 2_000;
@@ -1603,12 +1819,188 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers subagent control tools in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_message"), true);
+  });
+
+  it("delivers a message to a running subagent without aborting it", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    runningMap.set("a1", makeRunning());
+    let sent: [string, string] | undefined;
+
+    try {
+      const result = testApi.handleSubagentMessage(
+        { name: "Worker", message: "first\nsecond" },
+        (surface: string, message: string) => { sent = [surface, message]; },
+      );
+      assert.deepEqual(sent, ["pane-1", "first second"]);
+      assert.equal(result.details.status, "steered");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("delivers a pending child question to the parent once", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Use v1 or v2?" }));
+      // Deliberately no session_start: delivery must work off the extension
+      // instance alone, not a module-global set by an optional event.
+      const { api, sentMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      (subagentsModule as any).__test__.deliverPendingQuestion(
+        api,
+        makeRunning({ name: "Worker", sessionFile }),
+      );
+
+      assert.equal(sentMessages.length, 1);
+      assert.equal(sentMessages[0].message.customType, "subagent_question");
+      assert.match(sentMessages[0].message.content, /Use v1 or v2/);
+      // Renamed rather than deleted: the ask is still open, and the child is
+      // blocked in its tool call until an answer sidecar appears.
+      assert.equal(existsSync(`${sessionFile}.ask`), false);
+      assert.equal(existsSync(`${sessionFile}.ask.sent`), true);
+    });
+  });
+
+  it("does not re-steer an ask that was already announced", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      const { api, sentMessages } = createMockExtensionApi();
+
+      (subagentsModule as any).__test__.deliverPendingQuestion(
+        api,
+        makeRunning({ name: "Worker", sessionFile }),
+      );
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "again?" }));
+      (subagentsModule as any).__test__.deliverPendingQuestion(
+        api,
+        makeRunning({ name: "Worker", sessionFile }),
+      );
+
+      // Second call sees .ask.sent still present, so nothing new is announced.
+      assert.equal(sentMessages.length, 1);
+    });
+  });
+
+  it("answerPendingAsk writes the answer sidecar and clears the ask markers", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      const testApi = (subagentsModule as any).__test__;
+      writeFileSync(`${sessionFile}.ask.sent`, JSON.stringify({ question: "q" }));
+
+      testApi.answerPendingAsk(sessionFile, "BRAVO");
+
+      assert.equal(
+        JSON.parse(readFileSync(`${sessionFile}.answer`, "utf8")).text,
+        "BRAVO",
+      );
+      assert.equal(testApi.pendingAskPath(sessionFile), null);
+    });
+  });
+
+  describe("pickMultiple", () => {
+    const scriptedCtx = (answers: Array<string | undefined>) => ({
+      ui: {
+        select: async (_title: string, _options: string[]) => answers.shift(),
+      },
+    });
+
+    it("accumulates picks and finishes on Done", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const ctx = scriptedCtx(["[ ] ALPHA", "[ ] BRAVO", "Done (2 selected)"]);
+
+      const picked = await testApi.pickMultiple(ctx, "q", [
+        { label: "ALPHA" },
+        { label: "BRAVO" },
+      ]);
+
+      assert.deepEqual(picked, ["ALPHA", "BRAVO"]);
+    });
+
+    it("toggles an option back off", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const ctx = scriptedCtx(["[ ] ALPHA", "[x] ALPHA", "Done"]);
+
+      const picked = await testApi.pickMultiple(ctx, "q", [{ label: "ALPHA" }]);
+
+      assert.deepEqual(picked, []);
+    });
+
+    it("returns the option value rather than its label", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const ctx = scriptedCtx(["[ ] Ship it", "Done (1 selected)"]);
+
+      const picked = await testApi.pickMultiple(ctx, "q", [
+        { label: "Ship it", value: "ship" },
+      ]);
+
+      assert.deepEqual(picked, ["ship"]);
+    });
+
+    it("returns undefined when the user cancels", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const ctx = scriptedCtx([undefined]);
+
+      const picked = await testApi.pickMultiple(ctx, "q", [{ label: "ALPHA" }]);
+
+      assert.equal(picked, undefined);
+    });
+  });
+
+  it("routes an answer to a blocked child through the sidecar, not the pane", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "q" }));
+      runningMap.set("a1", makeRunning({ sessionFile }));
+      let pokedPane = false;
+
+      try {
+        const result = testApi.handleSubagentMessage(
+          { name: "Worker", message: "ALPHA" },
+          () => { pokedPane = true; },
+        );
+
+        // Typing into a pane whose turn is blocked would deadlock: the blocked
+        // tool call cannot end to consume the input.
+        assert.equal(pokedPane, false);
+        assert.equal(result.details.status, "answered");
+        assert.equal(JSON.parse(readFileSync(`${sessionFile}.answer`, "utf8")).text, "ALPHA");
+        assert.equal(testApi.pendingAskPath(sessionFile), null);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  it("keeps the question sidecar when the steer cannot be sent", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Use v1 or v2?" }));
+      const { api } = createMockExtensionApi();
+      api.sendMessage = () => {
+        throw new Error("session is gone");
+      };
+
+      (subagentsModule as any).__test__.deliverPendingQuestion(
+        api,
+        makeRunning({ name: "Worker", sessionFile }),
+      );
+
+      assert.equal(existsSync(`${sessionFile}.ask`), true);
+    });
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
@@ -1884,7 +2276,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_resume/);
+    assert.match(presentation, /subagent_message/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
@@ -1963,6 +2355,21 @@ describe("subagent status renderer", () => {
           `expected line width <= ${width}, got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
         );
       }
+    }
+  });
+});
+
+describe("subagent watcher lifecycle", () => {
+  it("replaces a stale aborted module signal", () => {
+    const key = Symbol.for("pi-subagents/poll-abort-controller");
+    const previous = (globalThis as any)[key];
+    const stale = new AbortController();
+    stale.abort();
+    (globalThis as any)[key] = stale;
+    try {
+      assert.equal((subagentsModule as any).__test__.getModuleAbortSignal().aborted, false);
+    } finally {
+      (globalThis as any)[key] = previous;
     }
   });
 });
@@ -2358,6 +2765,42 @@ describe("cmux.ts", () => {
 
     it("returns null when the parent pane cannot be found", () => {
       assert.equal(selectZellijPlacement([pane({ id: 10 })], 99), null);
+    });
+  });
+
+  describe("pollForExit", () => {
+    // Regression: a pane the user closed by hand can never write the sentinel.
+    // Swallowing that failure left the watcher spinning forever, so the running
+    // entry was never released and the Subagents widget kept showing the run.
+    it("gives up when the pane is gone instead of polling forever", async () => {
+      let calls = 0;
+      const result = await pollForExit("%87", new AbortController().signal, {
+        interval: 1,
+        readScreen: async () => {
+          calls += 1;
+          throw new Error("can't find pane: %87");
+        },
+      });
+
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage ?? "", /%87/);
+      assert.equal(calls, SURFACE_LOST_TOLERANCE);
+    });
+
+    it("keeps waiting through a transient screen-read failure", async () => {
+      let calls = 0;
+      const result = await pollForExit("%88", new AbortController().signal, {
+        interval: 1,
+        readScreen: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("tmux busy");
+          return "__SUBAGENT_DONE_0__";
+        },
+      });
+
+      assert.equal(result.reason, "sentinel");
+      assert.equal(result.exitCode, 0);
     });
   });
 

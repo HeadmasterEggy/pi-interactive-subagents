@@ -843,6 +843,13 @@ export function createSurfaceSplit(
       throw new Error(`Unexpected tmux split-window output: ${pane}`);
     }
 
+    // tmux splits the *current* pane, so N sequential spawns nest unevenly and
+    // the earlier agents end up in slivers. Normalise to an equal grid so every
+    // pane stays readable.
+    // ponytail: `tiled` equalises the parent pane too; switch to `main-vertical`
+    // if the parent should stay large.
+    rebalanceTmuxLayout(pane);
+
     return pane;
   }
 
@@ -1040,6 +1047,82 @@ export function sendCommand(surface: string, command: string): void {
 /**
  * Send one Escape keypress to an active pane.
  */
+/**
+ * Send named keys (tmux key names: "Down", "Enter", "Space", …) to a surface.
+ *
+ * Needed by tests that drive multi-step interactive UI, e.g. the subagent
+ * ask_question picker, where a single line of text is not enough.
+ */
+export function sendKeys(surface: string, keys: string[]): void {
+  const backend = requireMuxBackend();
+  const sequence = keys.join(" ");
+
+  if (backend === "cmux") {
+    execFileSync("cmux", ["send", "--surface", surface, tmuxKeysToAnsi(keys)], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
+  if (backend === "tmux") {
+    execFileSync("tmux", ["send-keys", "-t", surface, ...keys], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "wezterm") {
+    execFileSync(
+      "wezterm",
+      ["cli", "send-text", "--pane-id", surface, "--no-paste", tmuxKeysToAnsi(keys)],
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  // Zellij takes raw byte codes rather than key names.
+  zellijActionSync(["write", keys.map(zellijKeyCode).join(" ")], surface);
+  void sequence;
+}
+
+/** Map tmux key names onto the ANSI sequences terminals actually receive. */
+function tmuxKeysToAnsi(keys: string[]): string {
+  return keys
+    .map((key) => {
+      switch (key) {
+        case "Enter":
+          return "\r";
+        case "Up":
+          return "\u001b[A";
+        case "Down":
+          return "\u001b[B";
+        case "Space":
+          return " ";
+        case "Escape":
+          return "\u001b";
+        default:
+          return key;
+      }
+    })
+    .join("");
+}
+
+/** Map tmux key names onto Zellij `write` byte codes. */
+function zellijKeyCode(key: string): string {
+  switch (key) {
+    case "Enter":
+      return "13";
+    case "Up":
+      return "27 91 65";
+    case "Down":
+      return "27 91 66";
+    case "Space":
+      return "32";
+    case "Escape":
+      return "27";
+    default:
+      return key;
+  }
+}
+
 export function sendEscape(surface: string): void {
   const backend = requireMuxBackend();
 
@@ -1188,9 +1271,56 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
- * Close a pane.
+ * True when a mux error means the pane/surface is already gone.
+ *
+ * Closing a pane the user already closed is the end state we wanted, not a
+ * failure: every backend words this differently ("can't find pane: %87",
+ * "surface not found", …), so match on the shared vocabulary instead of
+ * tracking per-backend codes.
  */
+function isMissingSurfaceError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /can't find|not found|no such|does not exist|unknown (pane|surface|id)/i.test(message);
+}
+
+/**
+ * Close a pane. Idempotent: a pane that is already gone is not an error.
+ */
+/** Keep every pane in a tmux window equally sized. */
+function rebalanceTmuxLayout(target: string): void {
+  // ponytail: best-effort — a layout failure must never fail a spawn or a close.
+  try {
+    execFileSync("tmux", ["select-layout", "-t", target, "tiled"], { encoding: "utf8" });
+  } catch {}
+}
+
 export function closeSurface(surface: string): void {
+  // Capture the window before the pane disappears. tmux hands a closed pane's
+  // space to a neighbour, so without re-tiling the survivors end up in slivers
+  // and the user cannot see the remaining subagents.
+  let windowId: string | null = null;
+  if (getMuxBackend() === "tmux") {
+    try {
+      windowId = execFileSync(
+        "tmux",
+        ["display-message", "-p", "-t", surface, "#{window_id}"],
+        { encoding: "utf8" },
+      ).trim();
+    } catch {
+      windowId = null;
+    }
+  }
+
+  try {
+    closeSurfaceStrict(surface);
+  } catch (error) {
+    if (!isMissingSurfaceError(error)) throw error;
+  }
+
+  if (windowId) rebalanceTmuxLayout(windowId);
+}
+
+function closeSurfaceStrict(surface: string): void {
   const backend = requireMuxBackend();
 
   if (backend === "cmux") {
@@ -1252,6 +1382,12 @@ function interpretExitSidecar(data: any): PollResult {
 export const __pollForExitTest__ = { interpretExitSidecar };
 
 /**
+ * How many consecutive screen-read failures count as "this pane is gone".
+ * One failure can be a busy mux; three in a row with no exit sidecar cannot.
+ */
+export const SURFACE_LOST_TOLERANCE = 3;
+
+/**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
  * (written by subagent_done / caller_ping), falling back to the terminal
  * sentinel for crash detection.
@@ -1264,9 +1400,13 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Injectable for tests; defaults to the real mux screen reader. */
+    readScreen?: (surface: string, lines: number) => Promise<string>;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const readScreen = options.readScreen ?? readScreenAsync;
+  let screenReadFailures = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -1296,7 +1436,8 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readScreen(surface, 5);
+      screenReadFailures = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -1312,6 +1453,20 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+
+      // A destroyed pane can never write the sentinel, so waiting is waiting
+      // forever: the watcher would never release its running entry and the
+      // Subagents widget would show the run as still active. Give up instead.
+      screenReadFailures += 1;
+      if (screenReadFailures >= SURFACE_LOST_TOLERANCE) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage:
+            `Subagent pane ${surface} disappeared before it reported completion ` +
+            `(no exit signal was written). It may have been closed manually.`,
+        };
       }
     }
 

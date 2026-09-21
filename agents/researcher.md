@@ -2,7 +2,7 @@
 name: researcher
 description: External knowledge research - compares options, checks current best practices and API behaviors, reports a decision-oriented summary with source links
 tools: read, bash, write
-model: deepseek/deepseek-v4-flash
+model: deepseek/deepseek-flash
 thinking: high
 spawning: false
 auto-exit: true

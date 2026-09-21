@@ -11,6 +11,7 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
+  renameSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -18,6 +19,7 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
+  sendCommand,
   sendLongCommand,
   pollForExit,
   closeSurface,
@@ -32,7 +34,13 @@ import {
 import {
   findLastAssistantMessage,
   getNewEntries,
+  readNameRegistry,
+  readSubagentLoadout,
+  registerName,
+  resolveNameInRegistry,
   seedSubagentSessionFile,
+  writeSubagentLoadout,
+  type SubagentLoadout,
 } from "./session.ts";
 import {
   type StatusSnapshot,
@@ -81,7 +89,12 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 }
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  let controller = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  if (!controller || controller.signal.aborted) {
+    controller = new AbortController();
+    (globalThis as any)[POLL_ABORT_KEY] = controller;
+  }
+  return controller.signal;
 }
 
 const SubagentParams = Type.Object({
@@ -164,6 +177,7 @@ interface ListedAgentDefinition extends AgentDefinition {
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
+  "subagent_message",
   "subagents_list",
   "subagent_resume",
 ]);
@@ -444,7 +458,8 @@ function resolveResultPresentation(
   name: string,
 ): string {
   const sessionRef = result.sessionFile
-    ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+    ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}` +
+      `\nFollow up: subagent_message({ name: "${name}", message: "…" })`
     : "";
 
   if (result.errorMessage) {
@@ -457,7 +472,7 @@ function resolveResultPresentation(
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_resume.${sessionRef}`
+      `subagent or follow up with subagent_message.${sessionRef}`
     );
   }
 
@@ -507,6 +522,11 @@ interface RunningSubagent {
   sentinelFile?: string;
   statusState: SubagentStatusState;
   /**
+   * True while a UI picker for this subagent's ask_question is on screen, so a
+   * second tick cannot open a duplicate dialog for the same question.
+   */
+  askInFlight?: boolean;
+  /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
    * long-running agents where the user drives the conversation in the
@@ -517,6 +537,18 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+const reservedNames = new Set<string>();
+
+function uniqueSubagentName(base: string, artifactDir: string): string {
+  const taken = new Set(Object.keys(readNameRegistry(artifactDir)));
+  for (const running of runningSubagents.values()) taken.add(running.name);
+  for (const reserved of reservedNames) taken.add(reserved);
+  if (!taken.has(base)) return base;
+  for (let suffix = 2; ; suffix++) {
+    const candidate = `${base}-${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
 
 // ── Widget management ──
 
@@ -660,7 +692,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["ask_question", "caller_ping", "subagent_done"] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -697,13 +729,60 @@ function buildPiPromptArgs(params: {
     .filter(Boolean)
     .map((skill) => `/skill:${skill}`);
 
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
+  if (skillPrompts.length === 0) return [params.taskArg];
 
-  return [
-    ...(needsSeparator ? [""] : []),
-    ...skillPrompts,
-    params.taskArg,
-  ];
+  // Everything goes in ONE positional message.
+  //
+  // Pi expands `/skill:name` inside a prompt and expands `@file` references in
+  // the same string, so a single argument yields a single first user message
+  // containing the skill text AND the task. Passing them as separate arguments
+  // instead makes Pi treat the extras as queued follow-up messages delivered
+  // only AFTER the first turn — which lands the skill text on top of a child
+  // that is blocked in ask_question, and arrives too late to shape the work.
+  return [[...skillPrompts, params.taskArg].join(" ")];
+}
+
+/**
+ * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model,
+ * identity (system prompt), and the tool restriction.
+ *
+ * This is the single source of truth for reconstructing a subagent's sandbox,
+ * used both by the initial `launchSubagent` and by the resume paths so the two
+ * can never drift. Env vars and cwd are the caller's responsibility since they
+ * differ slightly between launch and resume.
+ */
+function applyLoadoutToParts(
+  parts: string[],
+  loadout: SubagentLoadout,
+  opts: { artifactDir: string; name: string },
+): void {
+  if (loadout.model) {
+    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
+    parts.push("--model", shellEscape(model));
+  }
+
+  // Identity goes through a file to avoid shell escaping issues with multiline
+  // content. Pi's --append-system-prompt and --system-prompt auto-detect file
+  // paths and read their contents.
+  if (loadout.identity) {
+    const flag =
+      loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const spSafeName = opts.name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+    mkdirSync(dirname(spPath), { recursive: true });
+    writeFileSync(spPath, loadout.identity, "utf8");
+    parts.push(flag, shellEscape(spPath));
+  }
+
+  if (loadout.toolAllowlist) {
+    parts.push("--tools", shellEscape(loadout.toolAllowlist));
+  }
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
@@ -834,6 +913,58 @@ function handleSubagentInterrupt(
   };
 }
 
+function handleSubagentMessage(
+  params: { name?: string; message?: string },
+  send: (surface: string, command: string) => void = sendCommand,
+) {
+  const message = params.message?.replace(/\s*\n\s*/g, " ").trim();
+  if (!message) {
+    const error = "Provide a non-empty `message`.";
+    return { content: [{ type: "text" as const, text: error }], details: { error } };
+  }
+
+  const resolved = resolveInterruptTarget({ name: params.name });
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+
+  // A child blocked in ask_question is not reading its pane, so typing into it
+  // would deadlock (the blocked tool call cannot end to consume the input).
+  // Resolve the ask through the sidecar it is actually polling instead.
+  if (readPendingAsk(running.sessionFile)) {
+    answerPendingAsk(running.sessionFile, message);
+    const now = Date.now();
+    running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+    updateWidget();
+    return {
+      content: [
+        { type: "text" as const, text: `Answer delivered to subagent "${running.name}".` },
+      ],
+      details: { id: running.id, name: running.name, status: "answered" },
+    };
+  }
+
+  try {
+    send(running.surface, message);
+  } catch (error: any) {
+    const text = `Failed to message subagent "${running.name}": ${error?.message ?? String(error)}`;
+    return { content: [{ type: "text" as const, text }], details: { error: text } };
+  }
+
+  const now = Date.now();
+  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  updateWidget();
+  return {
+    content: [{ type: "text" as const, text: `Message delivered to subagent "${running.name}".` }],
+    details: { id: running.id, name: running.name, status: "steered" },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -894,6 +1025,7 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
 
 export const __test__ = {
   borderLine,
+  getModuleAbortSignal,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
@@ -906,9 +1038,20 @@ export const __test__ = {
   formatWidgetRightLabel,
   observeRunningSubagent,
   resolveDenyTools,
+  applyLoadoutToParts,
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
+  handleSubagentMessage,
+  deliverPendingQuestion,
+  pendingAskPath,
+  readPendingAsk,
+  markAskAnnounced,
+  answerPendingAsk,
+  discardPendingAsk,
+  canPromptForAnswer,
+  pickMultiple,
+  uniqueSubagentName,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1088,33 +1231,26 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
-  }
-
-  // Pass agent body as system prompt via file to avoid shell escaping issues
-  // with multiline content. Pi's --append-system-prompt and --system-prompt
-  // auto-detect file paths and read their contents.
-  if (identityInSystemPrompt && identity) {
-    const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
-    mkdirSync(dirname(syspromptPath), { recursive: true });
-    writeFileSync(syspromptPath, identity, "utf8");
-    parts.push(flag, shellEscape(syspromptPath));
-  }
-
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-  if (toolAllowlist) {
-    parts.push("--tools", shellEscape(toolAllowlist));
-  }
+  // Snapshot the fully-resolved sandbox beside the session file so a later
+  // `subagent_message({ name })` resume replays the exact same model, identity,
+  // and tool restriction instead of relaunching with pi's defaults.
+  const loadout: SubagentLoadout = {
+    agent: params.agent ?? null,
+    toolAllowlist: buildSubagentToolAllowlist(effectiveTools),
+    denyTools: denySet.size > 0 ? [...denySet].join(",") : null,
+    model: effectiveModel ?? null,
+    thinking: effectiveThinking ?? null,
+    systemPromptMode: identityInSystemPrompt ? (systemPromptMode ?? "append") : null,
+    identity: identityInSystemPrompt ? (identity ?? null) : null,
+    autoExit: agentDefs?.autoExit ?? false,
+    cwd: effectiveCwd,
+    agentDir:
+      localAgentDir && existsSync(localAgentDir)
+        ? localAgentDir
+        : (process.env.PI_CODING_AGENT_DIR ?? null),
+  };
+  writeSubagentLoadout(subagentSessionFile, loadout);
+  applyLoadoutToParts(parts, loadout, { artifactDir, name: params.name });
 
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
@@ -1243,7 +1379,273 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/** Suffix of an ask whose question was already announced to the parent agent. */
+const ASK_SENT_SUFFIX = ".ask.sent";
+
+/** Payload written by a subagent's ask_question tool. */
+export interface PendingAsk {
+  name?: string;
+  agent?: string;
+  question?: string;
+  details?: string;
+  options?: Array<{ label: string; value?: string; description?: string }>;
+  multiSelect?: boolean;
+}
+
+/**
+ * Path of an unanswered ask, or null.
+ *
+ * `<session>.ask`      — question not yet handed off to the user/parent agent.
+ * `<session>.ask.sent` — already steered to the parent agent; awaiting its
+ *                        `subagent_message` reply. Re-steering would duplicate it.
+ */
+export function pendingAskPath(sessionFile: string): string | null {
+  for (const suffix of [".ask", ASK_SENT_SUFFIX]) {
+    const path = `${sessionFile}${suffix}`;
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
+export function readPendingAsk(sessionFile: string): PendingAsk | null {
+  const path = pendingAskPath(sessionFile);
+  if (!path) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    const ask = parsed as PendingAsk;
+    return typeof ask.question === "string" && ask.question.trim() ? ask : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearAskMarkers(sessionFile: string): void {
+  for (const suffix of [".ask", ASK_SENT_SUFFIX]) {
+    try {
+      unlinkSync(`${sessionFile}${suffix}`);
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/** Record that the question has been announced and not yet answered. */
+export function markAskAnnounced(sessionFile: string): void {
+  try {
+    renameSync(`${sessionFile}.ask`, `${sessionFile}${ASK_SENT_SUFFIX}`);
+  } catch {
+    // Lost the race with the child exiting; nothing left to answer.
+  }
+}
+
+/**
+ * Resolve a pending ask. Writes the `.answer` sidecar the blocked child polls
+ * and clears the ask markers so the question cannot be asked or answered twice.
+ */
+export function answerPendingAsk(sessionFile: string, text: string): void {
+  writeFileSync(`${sessionFile}.answer`, JSON.stringify({ text }));
+  clearAskMarkers(sessionFile);
+}
+
+/** Drop an ask that cannot be answered at all. */
+export function discardPendingAsk(sessionFile: string): void {
+  clearAskMarkers(sessionFile);
+}
+
+/**
+ * Serialise pop-up UI across extensions.
+ *
+ * `ctx.ui.custom()`/dialog calls can only handle one active call at a time, so
+ * this shares the same globalThis mutex that the local ask-user-question
+ * extension uses — both extensions can be on screen without importing each
+ * other.
+ */
+const SHARED_UI_LOCK_KEY = "__piSharedUiLock";
+
+function withSharedUiLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  const g = globalThis as any;
+  if (!g[SHARED_UI_LOCK_KEY]) {
+    let chain: Promise<void> = Promise.resolve();
+    g[SHARED_UI_LOCK_KEY] = {
+      withLock<V>(inner: () => V | Promise<V>): Promise<V> {
+        const prev = chain;
+        let release!: () => void;
+        chain = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return prev.then(inner).finally(() => release());
+      },
+    };
+  }
+  return (g[SHARED_UI_LOCK_KEY] as { withLock: <V>(fn: () => V | Promise<V>) => Promise<V> }).withLock(fn);
+}
+
+/**
+ * Whether this session can show the answer picker. Terminal-only: `select`
+ * needs a real TUI, and RPC/print sessions have nothing to render into.
+ */
+function canPromptForAnswer(): boolean {
+  return latestCtx?.hasUI === true && latestCtx.mode === "tui";
+}
+
+/**
+ * Deliver a pending `ask_question` sidecar.
+ *
+ * The child BLOCKS inside its ask_question tool until an answer sidecar
+ * appears, so the parent has exactly two ways to resolve it:
+ *   1. a UI picker in this (parent) session — preferred, the user answers
+ *      directly and no orchestrator turn is burned, or
+ *   2. a steer to the parent agent, which answers with `subagent_message`;
+ *      that path writes the answer sidecar too (see handleSubagentMessage).
+ *
+ * `pi` is the extension instance passed into the watcher's closure, matching
+ * every other steer in this file. An earlier version went through a
+ * module-global `latestPi`; when that global was null the question was dropped
+ * silently and the child — which suppresses auto-exit while it waits — hung
+ * forever with nobody able to answer it.
+ *
+ * The sidecar is removed only after the question has been handed off, so a
+ * failed handoff is retried on the next tick instead of losing the question.
+ */
+function deliverPendingQuestion(pi: ExtensionAPI, running: RunningSubagent): void {
+  const askPath = pendingAskPath(running.sessionFile);
+  if (!askPath) return;
+  // Already announced to the parent agent; it is awaiting subagent_message.
+  if (askPath.endsWith(ASK_SENT_SUFFIX)) return;
+
+  const ask = readPendingAsk(running.sessionFile);
+  if (!ask?.question) {
+    // Unparseable payload: drop it, otherwise every tick retries the same
+    // broken file forever.
+    discardPendingAsk(running.sessionFile);
+    return;
+  }
+
+  if (canPromptForAnswer()) {
+    if (running.askInFlight) return;
+    running.askInFlight = true;
+    void promptForAnswer(pi, running, ask).finally(() => {
+      running.askInFlight = false;
+    });
+    return;
+  }
+
+  const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
+  try {
+    pi.sendMessage(
+      {
+        customType: "subagent_question",
+        content:
+          `Sub-agent "${running.name}" asks (${formatElapsed(elapsed)}):\n\n${ask.question}` +
+          `\n\nReply with subagent_message({ name: "${running.name}", message: "…" }).`,
+        display: true,
+        details: { name: running.name, agent: running.agent, question: ask.question },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch {
+    // Keep the sidecar: the next tick retries rather than losing the question.
+    return;
+  }
+  markAskAnnounced(running.sessionFile);
+}
+
+/**
+ * Multi-select built from the stock selector: each pick toggles an option and
+ * re-opens the list with checked marks until Done is chosen.
+ *
+ * ponytail: a purpose-built `ctx.ui.custom` checkbox component would be a
+ * single dialog, but it is ~100 lines of TUI rendering plus the width-cache
+ * trap that `render()` must key on width (pi-tui does not invalidate on resize).
+ * Reach for that only if the reopen-per-toggle behaviour proves annoying.
+ */
+async function pickMultiple(
+  ctx: ExtensionContext,
+  title: string,
+  options: Array<{ label: string; value?: string }>,
+): Promise<string[] | undefined> {
+  const selected = new Map<number, string>();
+
+  for (;;) {
+    const entries = options.map((option, index) => ({
+      text: `${selected.has(index) ? "[x]" : "[ ]"} ${option.label}`,
+      index,
+    }));
+    const doneText = selected.size > 0 ? `Done (${selected.size} selected)` : "Done";
+    const picked = await ctx.ui.select(title, [...entries.map((entry) => entry.text), doneText]);
+
+    // Esc cancels the whole question.
+    if (picked === undefined) return undefined;
+    if (picked === doneText) return [...selected.values()];
+
+    const entry = entries.find((candidate) => candidate.text === picked);
+    if (!entry) continue;
+    const option = options[entry.index];
+    if (selected.has(entry.index)) selected.delete(entry.index);
+    else selected.set(entry.index, option.value ?? option.label);
+  }
+}
+
+async function promptForAnswer(
+  pi: ExtensionAPI,
+  running: RunningSubagent,
+  ask: PendingAsk,
+): Promise<void> {
+  const ctx = latestCtx;
+  if (!ctx) return;
+
+  const options = ask.options ?? [];
+  const title =
+    `Sub-agent "${running.name}" asks:\n\n${ask.question}` +
+    (ask.details ? `\n\n${ask.details}` : "");
+
+  let answered: string | undefined;
+  try {
+    answered = await withSharedUiLock(async () => {
+      if (options.length === 0) {
+        return await ctx.ui.input(title, "Type your answer, then Enter");
+      }
+      if (ask.multiSelect) {
+        const picked = await pickMultiple(ctx, title, options);
+        if (picked === undefined) return undefined;
+        return picked.length > 0 ? picked.join(", ") : "The user selected no options.";
+      }
+      const chosen = await ctx.ui.select(
+        title,
+        options.map((option) => option.label),
+      );
+      if (chosen === undefined) return undefined;
+      return options.find((option) => option.label === chosen)?.value ?? chosen;
+    });
+  } catch {
+    answered = undefined;
+  }
+
+  // Cancelling (Esc) must still release the child, otherwise it blocks until its
+  // wait ceiling expires with nobody able to reach it anymore.
+  const text =
+    answered === undefined || answered.trim() === ""
+      ? "The user cancelled the question. Continue with the best assumption available and state it in your summary."
+      : answered.trim();
+
+  answerPendingAsk(running.sessionFile, text);
+
+  pi.sendMessage(
+    {
+      customType: "subagent_question",
+      content:
+        `Sub-agent "${running.name}" asked:\n\n${ask.question}` +
+        `\n\nAnswered: ${text}`,
+      display: true,
+      details: { name: running.name, agent: running.agent, question: ask.question, answer: text },
+    },
+    { triggerTurn: false },
+  );
+}
+
 async function watchSubagent(
+  pi: ExtensionAPI,
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
@@ -1256,6 +1658,7 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
+        deliverPendingQuestion(pi, running);
       },
     });
 
@@ -1406,12 +1809,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Spawn a sub-agent in a background pane; its result arrives later as a steer message.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1446,8 +1844,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        // Names are persistent handles for subagent_message, so keep them unique
+        // across both running and completed subagents in this parent session.
+        const artifactDir = getArtifactDir(
+          ctx.sessionManager.getSessionDir(),
+          ctx.sessionManager.getSessionId(),
+        );
+        const name = uniqueSubagentName(params.name.trim() || params.agent || "subagent", artifactDir);
+        reservedNames.add(name);
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent({ ...params, name }, ctx);
+        } finally {
+          reservedNames.delete(name);
+        }
+        if (!running.cli) {
+          registerName(artifactDir, running.name, { sessionFile: running.sessionFile });
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1459,7 +1872,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(pi, running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -1523,7 +1936,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
+                `Sub-agent "${running.name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
@@ -1531,7 +1944,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ],
           details: {
             id: running.id,
-            name: params.name,
+            name: running.name,
             task: params.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
@@ -1607,9 +2020,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
         "and does not emit a subagent_result solely because of this request.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt a running sub-agent's current turn (sends Escape; the session stays alive).",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
@@ -1658,10 +2069,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "List all available subagent definitions. " +
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
         "Project-local agents override global ones with the same name.",
-      promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+      promptSnippet: "List available sub-agent definitions.",
       parameters: Type.Object({}),
 
       async execute() {
@@ -1706,8 +2114,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
-    pi.registerTool({
+  const resumeTool: any = {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
@@ -1718,12 +2125,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Resume a finished sub-agent session by file path, optionally with a follow-up message.",
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
@@ -1826,12 +2228,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
+        // Replay the sandbox snapshot written at spawn time, so a resumed session
+        // keeps its original model, identity, and tool restriction. Without it the
+        // child would relaunch with defaults — a silent privilege change for a
+        // restricted agent. When no snapshot exists we still resume (so the
+        // documented resume-by-path flow keeps working) but say so explicitly.
+        const loadout = readSubagentLoadout(params.sessionPath);
+        let sandboxWarning = "";
+        if (loadout) {
+          applyLoadoutToParts(parts, loadout, { artifactDir, name });
+        } else {
+          sandboxWarning =
+            `\n\nWarning: no sandbox snapshot was found for this session, so it was ` +
+            `resumed with the default model and full toolset rather than its original ` +
+            `restriction. Spawn a fresh subagent if you need the original sandbox.`;
+        }
+
+        // Build env prefix — replay the snapshot's config dir, agent identity, and
+        // denied tools so the resumed process resolves the same config it did before.
         const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+        const resumeAgentDir = loadout?.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
+        if (resumeAgentDir) {
+          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
+        }
+        if (loadout?.denyTools) {
+          resumeEnvParts.push(`PI_DENY_TOOLS=${shellEscape(loadout.denyTools)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
+        if (loadout?.agent) {
+          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
+        }
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
@@ -1840,7 +2266,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        // Resume in the subagent's original cwd so its tools operate where they did before.
+        const resumeCdPrefix = loadout?.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
+        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -1886,7 +2314,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(pi, running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
 
@@ -1951,7 +2379,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           });
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          content: [{ type: "text", text: `Session "${name}" resumed.${sandboxWarning}` }],
           details: {
             id,
             name,
@@ -1960,6 +2388,84 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+      },
+    };
+  if (shouldRegister("subagent_resume")) pi.registerTool(resumeTool);
+
+  // ── subagent_message tool ──
+  if (shouldRegister("subagent_message"))
+    pi.registerTool({
+      name: "subagent_message",
+      label: "Message Subagent",
+      description:
+        "Send a message to a subagent by name. If it is running, the message is delivered to its live pane. " +
+        "If it has finished, its session is resumed with the message. Both fields are required. " +
+        "Running delivery returns immediately; resumed results arrive automatically. Do not poll.",
+      promptSnippet:
+        "Message a sub-agent by name: steers it if running, resumes it if finished.",
+      parameters: Type.Object({
+        name: Type.String({ description: "Exact subagent display name" }),
+        message: Type.String({ description: "Message or follow-up instruction to deliver" }),
+      }),
+
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
+        const name = params.name?.trim();
+        const message = params.message?.trim();
+        if (!name || !message) {
+          const error = "`name` and `message` are required.";
+          return { content: [{ type: "text", text: error }], details: { error } };
+        }
+
+        const running = Array.from(runningSubagents.values()).find((agent) => agent.name === name);
+        if (running) return handleSubagentMessage({ name, message });
+
+        const artifactDir = getArtifactDir(
+          ctx.sessionManager.getSessionDir(),
+          ctx.sessionManager.getSessionId(),
+        );
+        const entry = resolveNameInRegistry(artifactDir, name);
+        if (!entry) {
+          const known = Object.keys(readNameRegistry(artifactDir));
+          const error =
+            `No subagent named "${name}" in this session.` +
+            (known.length ? ` Known subagents: ${known.join(", ")}.` : "");
+          return { content: [{ type: "text", text: error }], details: { error } };
+        }
+
+        if (reservedNames.has(name)) {
+          const error = `Subagent "${name}" is already being resumed.`;
+          return { content: [{ type: "text", text: error }], details: { error } };
+        }
+        reservedNames.add(name);
+        try {
+          return await resumeTool.execute(
+            toolCallId,
+            { sessionPath: entry.sessionFile, name, message, autoExit: true },
+            signal,
+            onUpdate,
+            ctx,
+          );
+        } finally {
+          reservedNames.delete(name);
+        }
+      },
+
+      renderCall(args, theme) {
+        return new Text(
+          "▸ " + theme.fg("toolTitle", theme.bold(args.name ?? "subagent")) +
+            theme.fg("dim", " — message"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        const status = details?.status === "steered" ? "message delivered" : "resumed";
+        const text = details?.status
+          ? `${details.name ?? "subagent"} — ${status}`
+          : (typeof result.content[0]?.text === "string" ? result.content[0].text : "");
+        return new Text(theme.fg("dim", text), 0, 0);
       },
     });
 
@@ -2035,7 +2541,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Clean summary (remove session ref and leading label for display)
         const summary = rawContent
-          .replace(/\n\nSession: .+\nResume: .+$/, "")
+          .replace(/\n\nSession: .+\nResume: .+\nFollow up: .+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
@@ -2059,6 +2565,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             contentLines.push("");
             contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
             contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
+            contentLines.push(
+              theme.fg("dim", `Follow up: subagent_message({ name: "${name}", message: "…" })`),
+            );
           }
         } else {
           // Collapsed: preview + expand hint
@@ -2106,6 +2615,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
+  // ── subagent_question message renderer ──
+  pi.registerMessageRenderer("subagent_question", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+        const contentLines = [
+          `${theme.fg("accent", "?")} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— asks")}`,
+        ];
+        if (options.expanded) {
+          contentLines.push("", details.question ?? "", "");
+          contentLines.push(
+            theme.fg("dim", `Reply: subagent_message({ name: "${name}", message: "…" })`),
+          );
+        } else {
+          contentLines.push(theme.fg("dim", (details.question ?? "").split("\n")[0].slice(0, width - 10)));
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+        const box = new Box(1, 1, (text: string) => theme.bg("toolSuccessBg", text));
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },

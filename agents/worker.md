@@ -2,9 +2,8 @@
 name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
 tools: read, bash, write, edit
-deny-tools: claude
-model: openai-codex/gpt-5.6-terra
-thinking: minimal
+model: openai-codex/gpt-5.6-luna
+thinking: high
 spawning: false
 auto-exit: true
 system-prompt: append

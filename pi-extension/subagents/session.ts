@@ -1,4 +1,12 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -65,6 +73,116 @@ export function seedSubagentSessionFile(params: {
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+}
+
+export interface NameRegistryEntry {
+  sessionFile: string;
+}
+
+/**
+ * Snapshot of everything needed to reconstruct a subagent's sandbox when its
+ * session is resumed. Written beside the session file as
+ * `<sessionFile>.loadout.json` at spawn time.
+ *
+ * Resume replays this exact snapshot so the reincarnated process gets the same
+ * model, identity, and tool restriction it originally ran with — instead of
+ * relaunching with pi's defaults (default model + full toolset), which would be
+ * an unannounced privilege change. Storing the resolved values rather than
+ * re-deriving them from the agent `.md` by name also keeps resume faithful if
+ * the agent definition is later edited, moved, or deleted.
+ */
+export interface SubagentLoadout {
+  /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
+  agent: string | null;
+  /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
+  toolAllowlist: string | null;
+  /** Comma-separated denied tool names (for PI_DENY_TOOLS), or null. */
+  denyTools: string | null;
+  /** Model id (without thinking suffix), or null for the session default. */
+  model: string | null;
+  /** Thinking level appended to the model as `model:level`, or null. */
+  thinking: string | null;
+  /** How the identity text was applied: append/replace, or null. */
+  systemPromptMode: "append" | "replace" | null;
+  /** The system-prompt/identity text, only when it lived in the system prompt. */
+  identity: string | null;
+  /** Whether the agent auto-exits (informational; resume uses its own flag). */
+  autoExit: boolean;
+  /** Working directory the subagent ran in, or null. */
+  cwd: string | null;
+  /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
+  agentDir: string | null;
+}
+
+/** Path of the loadout sidecar written next to a subagent session file. */
+export function loadoutSidecarPath(sessionFile: string): string {
+  return `${sessionFile}.loadout.json`;
+}
+
+/** Persist a subagent's resolved sandbox loadout beside its session file. */
+export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
+  try {
+    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
+  } catch {
+    // Best-effort: a missing snapshot only means resume runs without the
+    // original sandbox and says so, never that it silently escalates.
+  }
+}
+
+/** Read a subagent's loadout snapshot, or null if absent/unparseable. */
+export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
+  try {
+    const path = loadoutSidecarPath(sessionFile);
+    if (!existsSync(path)) return null;
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as SubagentLoadout;
+  } catch {
+    return null;
+  }
+}
+
+export type NameRegistry = Record<string, NameRegistryEntry>;
+
+function nameRegistryPath(artifactDir: string): string {
+  return join(artifactDir, "subagent-registry.json");
+}
+
+export function readNameRegistry(artifactDir: string): NameRegistry {
+  try {
+    const path = nameRegistryPath(artifactDir);
+    if (!existsSync(path)) return {};
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function registerName(
+  artifactDir: string,
+  name: string,
+  entry: NameRegistryEntry,
+): void {
+  try {
+    mkdirSync(artifactDir, { recursive: true });
+    const registry = readNameRegistry(artifactDir);
+    registry[name] = entry;
+    const path = nameRegistryPath(artifactDir);
+    const temp = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+    writeFileSync(temp, JSON.stringify(registry, null, 2), "utf8");
+    renameSync(temp, path);
+  } catch {
+    // Best effort: spawning still works if the persistent name handle cannot be written.
+  }
+}
+
+export function resolveNameInRegistry(
+  artifactDir: string,
+  name: string,
+): NameRegistryEntry | null {
+  const entry = readNameRegistry(artifactDir)[name];
+  return entry && typeof entry.sessionFile === "string" ? entry : null;
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {

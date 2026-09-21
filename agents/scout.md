@@ -2,8 +2,7 @@
 name: scout
 description: Fast codebase reconnaissance - maps existing code, conventions, and patterns for a task
 tools: read, bash, write
-deny-tools: claude
-model: deepseek/deepseek-v4-flash
+model: deepseek/deepseek-flash
 output: context.md
 spawning: false
 auto-exit: true

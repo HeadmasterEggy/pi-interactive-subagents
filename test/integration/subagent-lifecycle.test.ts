@@ -13,7 +13,7 @@
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: deepseek/deepseek-flash)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -27,6 +27,8 @@ import {
   cleanupTestEnv,
   createTrackedSurface,
   startPi,
+  sendCommand,
+  sendKeys,
   waitForScreen,
   waitForFile,
   sleep,
@@ -274,6 +276,82 @@ for (const backend of backends) {
         /needs help|PING/i.test(screen),
         `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
       );
+    });
+
+    // ── Child-to-parent question relay ──
+
+    it("subagent ask_question surfaces as a picker and the child resumes after it is answered", async () => {
+      const id = uniqueId();
+
+      const surface = createTrackedSurface(env, `ask-${id}`);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Ask-${id}"`,
+        `  agent: "test-ask"`,
+        `  task: "QA_${id}"`,
+        `Just call the subagent tool once. Do not do anything else before calling it.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      // Stage 1: the child's ask_question must surface in THIS session as a
+      // picker. This goes through the watcher's onTick, so a broken call site
+      // there (a ReferenceError) fails here instead of silently stranding the
+      // child in "waiting" with nobody able to answer it.
+      //
+      // "Which marker word" comes from the test-ask agent definition, never from
+      // the task text above, so this cannot false-pass on the echoed prompt.
+      await waitForScreen(surface, /Which marker word/, PI_TIMEOUT);
+
+      // Stage 2: answer it the way a user does — Enter selects the highlighted
+      // (first) option. The parent agent is not woken for this; the answer goes
+      // straight back to the child blocked inside its tool call.
+      sendCommand(surface, "");
+
+      // Stage 3: ASK_REPLY only exists in the child's final message, which
+      // reaches this session as the subagent result summary.
+      const doneScreen = await waitForScreen(surface, /ASK_REPLY/, PI_TIMEOUT);
+      assert.ok(
+        /ASK_REPLY/.test(doneScreen),
+        `The answered child should finish with its reply. Got:\n${doneScreen.slice(-800)}`,
+      );
+    });
+
+    it("subagent multi-select ask_question collects several answers", async () => {
+      const id = uniqueId();
+      const markerFile = `/tmp/pi-ask-multi-${id}.txt`;
+      trackTempFile(env, markerFile);
+
+      const surface = createTrackedSurface(env, `ask-multi-${id}`);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "AskMulti-${id}"`,
+        `  agent: "test-ask-multi"`,
+        `  task: "Write the answer you receive into ${markerFile}"`,
+        `Just call the subagent tool once. Do not do anything else before calling it.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      // "Which marker words" comes from the test-ask-multi agent definition, so
+      // this cannot false-pass on the echoed prompt.
+      await waitForScreen(surface, /Which marker words/, PI_TIMEOUT);
+
+      // Drive the toggle dialog the way a user does. Each pick reopens the list
+      // with checked marks, so: pick ALPHA, then BRAVO, then Done.
+      sendKeys(surface, ["Enter"]);
+      await sleep(500);
+      sendKeys(surface, ["Down", "Enter"]);
+      await sleep(500);
+      sendKeys(surface, ["Down", "Down", "Enter"]);
+
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /ALPHA/);
+      assert.match(content, /ALPHA/, `Both picks should reach the child. Got: ${content}`);
+      assert.match(content, /BRAVO/, `Both picks should reach the child. Got: ${content}`);
     });
 
     // ── Agent discovery ──

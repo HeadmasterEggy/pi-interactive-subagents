@@ -20,6 +20,7 @@ export type SubagentActivityEvent =
   | "tool_execution_update"
   | "tool_result"
   | "tool_execution_end"
+  | "ask_question"
   | "caller_ping"
   | "subagent_done"
   | "session_shutdown";
@@ -70,6 +71,7 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
+  askQuestion(): void;
   callerPing(): void;
   subagentDone(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
@@ -95,6 +97,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_execution_update",
   "tool_result",
   "tool_execution_end",
+  "ask_question",
   "caller_ping",
   "subagent_done",
   "session_shutdown",
@@ -239,6 +242,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionUpdate() {},
     toolResult() {},
     toolExecutionEnd() {},
+    askQuestion() {},
     callerPing() {},
     subagentDone() {},
     sessionShutdown() {},
@@ -495,6 +499,13 @@ export function createSubagentActivityRecorder(params: {
         current.toolName = toolName ?? current.toolName;
         current.toolEndedAt = observedAt;
         refreshActiveScope(current);
+      }, "immediate");
+    },
+    askQuestion() {
+      record("ask_question", (current, observedAt) => {
+        clearActiveState(current);
+        current.phase = "waiting";
+        current.waitingSince = observedAt;
       }, "immediate");
     },
     callerPing() {

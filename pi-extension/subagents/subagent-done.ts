@@ -1,12 +1,12 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+O)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -75,6 +75,72 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** Answer sidecar written by the parent orchestration when it resolves an ask. */
+export interface AskAnswerPayload {
+  text?: string;
+}
+
+export type AskOutcome =
+  | { ok: true; text: string }
+  | { ok: false; reason: "cancelled" | "timeout" };
+
+/** Poll interval for the answer sidecar. */
+export const ASK_POLL_INTERVAL_MS = 250;
+
+/**
+ * Ceiling for a blocked ask.
+ *
+ * ponytail: a blocked tool call has no natural bound, so if the parent session
+ * dies (or its watcher is aborted) while a child is waiting, the child would
+ * block until its pane is killed. Bound it and resume the agent loop with an
+ * explicit failure instead. Raise it if legitimately long human waits are needed.
+ */
+export const ASK_MAX_WAIT_MS = 30 * 60 * 1000;
+
+function removeQuietly(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * Block until the parent writes an answer sidecar, the tool is aborted, or the
+ * wait ceiling is hit. The sidecar is consumed so a later ask cannot replay a
+ * stale answer.
+ */
+export async function waitForAnswer(
+  sessionFile: string,
+  signal?: AbortSignal,
+  timeoutMs: number = ASK_MAX_WAIT_MS,
+): Promise<AskOutcome> {
+  const answerFile = `${sessionFile}.answer`;
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    if (signal?.aborted) return { ok: false, reason: "cancelled" };
+
+    if (existsSync(answerFile)) {
+      let text = "(the parent sent an empty answer)";
+      try {
+        const parsed = JSON.parse(readFileSync(answerFile, "utf8")) as AskAnswerPayload;
+        if (typeof parsed?.text === "string" && parsed.text.trim() !== "") {
+          text = parsed.text;
+        }
+      } catch {
+        // Unparseable: fall back to the placeholder rather than blocking forever.
+      }
+      removeQuietly(answerFile);
+      return { ok: true, text };
+    }
+
+    if (Date.now() >= deadline) return { ok: false, reason: "timeout" };
+
+    await new Promise<void>((resolve) => setTimeout(resolve, ASK_POLL_INTERVAL_MS));
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -102,7 +168,7 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const hint = theme.fg("muted", "  (Ctrl+Alt+O to collapse)");
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -129,7 +195,7 @@ export default function (pi: ExtensionAPI) {
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", "  (Ctrl+Alt+O to expand)");
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
@@ -143,6 +209,7 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let awaitingAnswer = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -156,6 +223,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
+    awaitingAnswer = false;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
@@ -168,12 +236,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    awaitingAnswer = false;
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const shouldExit =
+      !awaitingAnswer && autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -256,12 +326,122 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionShutdown((event as any).reason);
   });
 
-  // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
+  // Toggle expand/collapse with Ctrl+Alt+O (Ctrl+J is pi's built-in newline binding)
+  pi.registerShortcut("ctrl+alt+o", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;
       renderWidget(ctx, null);
+    },
+  });
+
+  pi.registerTool({
+    name: "ask_question",
+    label: "Ask Question",
+    description:
+      "Ask the parent orchestrator one question and BLOCK until it answers. " +
+      "Use this instead of guessing when requirements or decisions are unclear. " +
+      "The answer is returned as this tool's result, so do not repeat the question " +
+      "and do not call subagent_done while waiting.",
+    parameters: Type.Object({
+      question: Type.String({ description: "The single question to ask the orchestrator" }),
+      details: Type.Optional(
+        Type.String({ description: "Optional extra context shown under the question" }),
+      ),
+      options: Type.Optional(
+        Type.Array(
+          Type.Object({
+            label: Type.String({ description: "Display label for this choice" }),
+            value: Type.Optional(
+              Type.String({ description: "Optional value returned instead of the label" }),
+            ),
+            description: Type.Optional(
+              Type.String({ description: "Optional extra detail shown below the option" }),
+            ),
+          }),
+          {
+            description:
+              "Optional multiple-choice options. The parent can pick one directly, " +
+              "which is faster and more reliable than a free-text answer.",
+          },
+        ),
+      ),
+      multiSelect: Type.Optional(
+        Type.Boolean({
+          description:
+            "Set to true to let the parent pick several options. The answer lists " +
+            "every pick. Ignored when no options are given.",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (!sessionFile) {
+        throw new Error(
+          "ask_question is only available in subagent contexts. " +
+            "PI_SUBAGENT_SESSION environment variable is not set.",
+        );
+      }
+
+      const askFile = `${sessionFile}.ask`;
+      const options = Array.isArray(params.options)
+        ? params.options.filter((option: any) => option && typeof option.label === "string")
+        : undefined;
+      const multiSelect = options && options.length > 0 ? params.multiSelect === true : undefined;
+
+      awaitingAnswer = true;
+      recorder.askQuestion();
+      // Never consume a leftover answer from an earlier ask.
+      removeQuietly(`${sessionFile}.answer`);
+      removeQuietly(`${askFile}.sent`);
+      writeFileSync(
+        askFile,
+        JSON.stringify({
+          name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+          agent: process.env.PI_SUBAGENT_AGENT ?? "",
+          question: params.question,
+          details: params.details,
+          options,
+          multiSelect,
+        }),
+      );
+
+      const outcome = await waitForAnswer(sessionFile, signal);
+
+      awaitingAnswer = false;
+      removeQuietly(askFile);
+      removeQuietly(`${askFile}.sent`);
+
+      if (!outcome.ok) {
+        const text =
+          outcome.reason === "timeout"
+            ? "No answer arrived before the wait ceiling; the parent may no longer be running. " +
+              "Continue with the best assumption available and state it in your summary."
+            : "The parent cancelled the question. Continue with the best assumption available " +
+              "and state it in your summary.";
+        return {
+          content: [{ type: "text", text }],
+          details: { question: params.question, answered: false, reason: outcome.reason },
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: `Answer from the parent: ${outcome.text}` }],
+        details: { question: params.question, answered: true, answer: outcome.text },
+      };
+    },
+
+    renderCall(args, theme) {
+      const options = Array.isArray((args as any).options) ? (args as any).options : [];
+      let text =
+        theme.fg("toolTitle", theme.bold("ask_question ")) +
+        theme.fg("muted", String((args as any).question ?? ""));
+      if (options.length > 0) {
+        const labels = options.map((option: any) => String(option?.label ?? "")).join(", ");
+        const suffix = (args as any).multiSelect ? " [multi-select]" : "";
+        text += `\n${theme.fg("dim", `  Options${suffix}: ${labels}`)}`;
+      }
+      return new Text(text, 0, 0);
     },
   });
 
